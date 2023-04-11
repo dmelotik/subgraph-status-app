@@ -1,0 +1,380 @@
+const axios = require("axios");
+
+const QUERY_CONTENTS = `
+subgraph
+synced
+fatalError {
+  message
+  block {
+    number
+  }
+}
+chains {
+  chainHeadBlock {
+    number
+  }
+  earliestBlock {
+    number
+  }
+  latestBlock {
+    number
+  }
+}`;
+
+// test to see if the api key provided is valid
+async function testDecNetworkApiKey(apiKey) {
+  const endpoint =
+    "https://gateway.thegraph.com/api/" + apiKey + "/subgraphs/id/test";
+  const string = `query MyQuery {
+      _meta {
+          deployment
+      }
+  }`;
+
+  return axios.post(
+    endpoint,
+    { query: string },
+    {
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+    }
+  );
+}
+
+async function generateProtocolToBaseMap(data) {
+  const protocolToBaseMap = {};
+  if (Object.keys(data)?.length > 0) {
+    Object.keys(data).forEach((protocolName) => {
+      const protocol = data[protocolName];
+      protocolToBaseMap[protocolName] = protocol.base;
+    });
+  }
+  return protocolToBaseMap;
+}
+
+async function generateDecenEndpoints(data) {
+  const hostedEndpointToDecenNetwork = {};
+  try {
+    if (Object.keys(data)?.length > 0) {
+      Object.keys(data).forEach((protocolName) => {
+        const protocol = data[protocolName];
+        if (!protocol.schema) {
+          return;
+        }
+        Object.values(protocol.deployments).forEach((depoData) => {
+          let hostedServiceId = "";
+          const hostedServiceObject = depoData?.services["hosted-service"];
+          if (!!hostedServiceObject) {
+            hostedServiceId = hostedServiceObject?.slug;
+          }
+          const decenObj = depoData?.services["decentralized-network"];
+          if (!!decenObj) {
+            hostedEndpointToDecenNetwork[
+              "https://api.thegraph.com/subgraphs/name/messari/" +
+                hostedServiceId
+            ] = decenObj?.["query-id"];
+          }
+        });
+      });
+    }
+  } catch (err) {
+    console.log("ERROR: " + err.message);
+  }
+  return hostedEndpointToDecenNetwork;
+}
+
+async function getHostedServiceEndpoints(data) {
+  try {
+    const subgraphEndpoints = {};
+    if (Object.keys(data)?.length > 0) {
+      Object.keys(data).forEach((protocolName) => {
+        const protocol = data[protocolName];
+        if (!protocol.schema) {
+          return;
+        }
+        if (!Object.keys(subgraphEndpoints).includes(protocol.schema)) {
+          subgraphEndpoints[protocol.schema] = {};
+        }
+        if (
+          !Object.keys(subgraphEndpoints[protocol.schema]).includes(
+            protocolName
+          )
+        ) {
+          subgraphEndpoints[protocol.schema][protocolName] = {};
+        }
+        Object.values(protocol.deployments).forEach((depoData) => {
+          let hostedServiceId = "";
+          if (!!depoData?.services["hosted-service"]) {
+            hostedServiceId = depoData?.services["hosted-service"]?.slug;
+          }
+          subgraphEndpoints[protocol.schema][protocolName][depoData.network] =
+            "https://api.thegraph.com/subgraphs/name/messari/" +
+            hostedServiceId;
+        });
+      });
+    }
+    return subgraphEndpoints;
+  } catch (err) {
+    console.log("ERROR: " + err.message);
+  }
+}
+
+async function queryDecentralizedIndex(
+  hostedEndpointToDecenNetwork,
+  graphApiKey
+) {
+  const decenQueries = Object.values(hostedEndpointToDecenNetwork).map(
+    (decenNetwork) => {
+      if (!decenNetwork) {
+        return null;
+      }
+      const endpoint =
+        "https://gateway.thegraph.com/api/" +
+        graphApiKey +
+        "/subgraphs/id/" +
+        decenNetwork;
+      const string = `query MyQuery {
+      _meta {
+          deployment
+      }
+      protocols {
+        name
+        schemaVersion
+        type
+    }
+  }`;
+
+      return axios.post(
+        endpoint,
+        { query: string },
+        {
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json",
+          },
+        }
+      );
+    }
+  );
+
+  const decenSubgraphHashToIndexingObj = {};
+  const decenDeploymentMapping = {};
+  const decenDepoToSubgraphVersion = {};
+  const decenErrorObj = {};
+  await Promise.allSettled(decenQueries)
+    .then((response) => {
+      response.forEach((metaData) => {
+        if (metaData?.value?.data?.data?._meta?.deployment) {
+          decenDeploymentMapping[
+            metaData?.value?.data?.data?._meta?.deployment
+          ] = metaData?.value?.config?.url?.split("/subgraphs/id/")?.[1];
+          decenDepoToSubgraphVersion[
+            metaData?.value?.data?.data?._meta?.deployment
+          ] =
+            metaData?.value?.data?.data?.protocols?.[0]?.schemaVersion ||
+            "0.0.0";
+        } else {
+          decenErrorObj[
+            metaData?.value?.config?.url?.split("/subgraphs/id/")?.[1]
+          ] = metaData?.value?.data?.errors?.message;
+        }
+      });
+    })
+    .catch((err) => console.log("ERROR: " + err.message));
+  if (Object.keys(decenDeploymentMapping)?.length > 0) {
+    const indexingQuery = `query Status { indexingStatuses(subgraphs: ${JSON.stringify(
+      Object.keys(decenDeploymentMapping)
+    )} ) { 
+      ${QUERY_CONTENTS}
+  }
+  }`;
+
+    let res = {};
+    try {
+      res = await axios.post("https://api.thegraph.com/index-node/graphql", {
+        query: indexingQuery,
+      });
+    } catch (err) {
+      console.log("ERROR: " + err.message);
+    }
+    console.log(res?.data?.data?.indexingStatuses?.length, "gadzoo");
+    try {
+      res?.data?.data?.indexingStatuses?.forEach((obj) => {
+        let indexedPercentage =
+          (obj?.chains[0]?.latestBlock?.number -
+            obj?.chains[0]?.earliestBlock?.number) /
+            (obj?.chains[0]?.chainHeadBlock?.number -
+              obj?.chains[0]?.earliestBlock?.number) || 0;
+        indexedPercentage = indexedPercentage * 100;
+        if (indexedPercentage > 99.5) {
+          indexedPercentage = 100;
+        }
+        decenSubgraphHashToIndexingObj[decenDeploymentMapping[obj?.subgraph]] =
+          {
+            endpoint:
+              "https://gateway.thegraph.com/api/" +
+              apiKeyToUse +
+              "/subgraphs/id/" +
+              decenDeploymentMapping[obj?.subgraph],
+            hash: obj?.subgraph,
+            indexingErrorMessage: obj?.fatalError?.message,
+            indexingErrorBlock: obj?.chains[0]?.latestBlock?.number,
+            indexingPercentage: indexedPercentage.toFixed(2),
+            synced: obj?.synced,
+            version: decenDepoToSubgraphVersion[obj?.subgraph] || "0.0.0",
+          };
+      });
+    } catch (err) {
+      console.log("ERROR: " + err.message);
+    }
+  } else {
+    console.log(
+      "ERRORS: " +
+        Object.values(decenErrorObj).join(" | ").slice(0, 500) +
+        "..."
+    );
+  }
+  return decenSubgraphHashToIndexingObj;
+}
+
+async function indexStatusFlow(deployments) {
+  try {
+    const generateIndexStatus = await generateIndexStatusQuery(deployments);
+    deployments = JSON.parse(JSON.stringify(generateIndexStatus.deployments));
+
+    const indexingStatusQueriesArray =
+      generateIndexStatus.indexingStatusQueries;
+    const indexData = await getIndexingStatusData(indexingStatusQueriesArray);
+    Object.keys(indexData).forEach((indexDataName) => {
+      const realNameString = indexDataName.split("_").join("-");
+      if (!indexData[indexDataName] && indexDataName.includes("pending")) {
+        delete deployments[realNameString];
+        return;
+      }
+      if (indexDataName.includes("pending")) {
+        deployments[realNameString].url =
+          "https://api.thegraph.com/subgraphs/id/" +
+          indexData[indexDataName]?.subgraph;
+        deployments[realNameString].hash = indexData[indexDataName]?.subgraph;
+      }
+
+      let indexedPercentage =
+        (indexData[indexDataName]?.chains[0]?.latestBlock?.number -
+          indexData[indexDataName]?.chains[0]?.earliestBlock?.number) /
+          (indexData[indexDataName]?.chains[0]?.chainHeadBlock?.number -
+            indexData[indexDataName]?.chains[0]?.earliestBlock?.number) || 0;
+      indexedPercentage = indexedPercentage * 100;
+      if (indexedPercentage > 99.5) {
+        indexedPercentage = 100;
+      }
+      deployments[realNameString].indexedPercentage =
+        indexedPercentage.toFixed(2);
+      deployments[realNameString].synced = indexData[indexDataName]?.synced;
+      if (!!indexData[indexDataName]?.fatalError) {
+        deployments[realNameString].indexingError =
+          indexData[indexDataName]?.fatalError?.block?.number || 0;
+        deployments[realNameString].indexingErrorMessage =
+          indexData[indexDataName]?.fatalError?.message || "ERROR";
+      }
+    });
+    return deployments;
+  } catch (err) {
+    console.log("ERROR: " + err.message);
+  }
+}
+
+async function getIndexingStatusData(indexingStatusQueriesArray) {
+  try {
+    const indexingStatusQueries = indexingStatusQueriesArray.map((query) => {
+      return axios.post("https://api.thegraph.com/index-node/graphql", {
+        query: query,
+      });
+    });
+    let indexData = [];
+    await Promise.all(indexingStatusQueries)
+      .then((response) => {
+        return (indexData = response.map((resultData) => {
+          return resultData.data.data;
+        }));
+      })
+      .catch((err) => {
+        console.log("ERROR: " + err);
+      });
+
+    let dataObjectToReturn = {};
+    indexData.forEach((dataset) => {
+      dataObjectToReturn = { ...dataObjectToReturn, ...dataset };
+    });
+    return dataObjectToReturn;
+  } catch (err) {
+    console.log("ERROR: " + err.message);
+  }
+}
+
+async function generateIndexStatusQuery(deployments) {
+  const fullCurrentQueryArray = ["query Status {"];
+  const fullPendingQueryArray = ["query Status {"];
+
+  try {
+    Object.keys(deployments).forEach((name) => {
+      fullCurrentQueryArray[fullCurrentQueryArray.length - 1] += `        
+              ${name
+                .split("-")
+                .join(
+                  "_"
+                )}: indexingStatusForCurrentVersion(subgraphName: "messari/${name}") {
+                ${QUERY_CONTENTS}
+              }
+          `;
+      fullPendingQueryArray[fullPendingQueryArray.length - 1] += `        
+            ${name
+              .split("-")
+              .join(
+                "_"
+              )}_pending: indexingStatusForPendingVersion(subgraphName: "messari/${name}") {
+              ${QUERY_CONTENTS}
+            }
+        `;
+      if (
+        fullCurrentQueryArray[fullCurrentQueryArray.length - 1].length > 80000
+      ) {
+        fullCurrentQueryArray[fullCurrentQueryArray.length - 1] += "}";
+        fullCurrentQueryArray.push(" query Status {");
+      }
+      if (
+        fullPendingQueryArray[fullPendingQueryArray.length - 1].length > 80000
+      ) {
+        fullPendingQueryArray[fullPendingQueryArray.length - 1] += "}";
+        fullPendingQueryArray.push(" query Status {");
+      }
+    });
+    fullCurrentQueryArray[fullCurrentQueryArray.length - 1] += "}";
+    fullPendingQueryArray[fullPendingQueryArray.length - 1] += "}";
+    const currentStateDepos = JSON.parse(JSON.stringify(deployments));
+    Object.keys(currentStateDepos)
+      .filter((name) => !name.includes("decen"))
+      .forEach((name) => {
+        deployments[name + "-pending"] = JSON.parse(
+          JSON.stringify({ ...deployments[name] })
+        );
+        deployments[name + "-pending"].pending = true;
+      });
+    const indexingStatusQueries = [
+      ...fullCurrentQueryArray,
+      ...fullPendingQueryArray,
+    ];
+    return { deployments, indexingStatusQueries };
+  } catch (err) {
+    console.log("ERROR: " + err.message);
+  }
+}
+
+module.exports = {
+  getHostedServiceEndpoints: getHostedServiceEndpoints,
+  indexStatusFlow: indexStatusFlow,
+  queryDecentralizedIndex: queryDecentralizedIndex,
+  generateDecenEndpoints: generateDecenEndpoints,
+  testDecNetworkApiKey: testDecNetworkApiKey,
+};
